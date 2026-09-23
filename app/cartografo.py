@@ -1,0 +1,353 @@
+"""
+Cartografo simplificado para Bot Tendencia.
+Fetch de datos Hyperliquid + calculo de bias multi-timeframe.
+Sin statsmodels (ADF/FFD omitidos). Solo 3 activos.
+Retorna GEM_MACRO_CONTEXT que consume la Brujula.
+"""
+import asyncio
+import aiohttp
+import time
+import numpy as np
+import pandas as pd
+from typing import Dict, Any, Optional
+
+from app.config import ASSETS, HL_REST_URL
+
+# Parametros del Cartografo
+MACRO_LOOKBACK_DAYS = 30
+REST_API_TIMEOUT = 10
+SMA_TREND_PERIOD = 50
+BREAKOUT_LOOKBACK = 10
+MIN_CANDLES_1H = 20
+MIN_CANDLES_15M = 30
+MIN_CANDLES_5M = 200
+STRONG_BIAS_THRESHOLD = 2
+
+
+async def fetch_candles(
+    session: aiohttp.ClientSession,
+    coin: str,
+    interval: str,
+    lookback_days: int = 30
+) -> Optional[pd.DataFrame]:
+    """Fetch de velas desde Hyperliquid REST API."""
+    st_time = int((time.time() - 86400 * lookback_days) * 1000)
+    payload = {
+        "type": "candleSnapshot",
+        "req": {
+            "coin": coin,
+            "interval": interval,
+            "startTime": st_time,
+        },
+    }
+    try:
+        async with session.post(
+            HL_REST_URL,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=REST_API_TIMEOUT),
+        ) as resp:
+            data = await resp.json()
+            if not isinstance(data, list) or len(data) < 10:
+                return None
+            df = pd.DataFrame(data)
+            for c in ["t", "o", "h", "l", "c", "v"]:
+                if c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+            df = df.dropna(subset=["c"])
+            if len(df) < 10:
+                return None
+            return df
+    except Exception as e:
+        print(f"  WARNING fetch_candles({coin}, {interval}): {e}")
+        return None
+
+
+def calc_bias_1h(df: pd.DataFrame) -> str:
+    """Calcula bias de 1H usando SMA + breakout."""
+    if df is None or len(df) < MIN_CANDLES_1H:
+        return "RANGO"
+
+    last = float(df["c"].iloc[-1])
+    w = min(SMA_TREND_PERIOD, len(df))
+    sma = float(df["c"].rolling(w).mean().iloc[-1])
+
+    fb = bool(df["l"].iloc[-1] > df["h"].iloc[-3]) if len(df) >= 3 else False
+    fe = bool(df["h"].iloc[-1] < df["l"].iloc[-3]) if len(df) >= 3 else False
+
+    if last > sma and fb:
+        return "BULL"
+    if last < sma and fe:
+        return "BEAR"
+
+    bw = min(BREAKOUT_LOOKBACK, len(df) - 1)
+    if bw > 0:
+        if last > df["h"].rolling(bw).max().iloc[-2] and last > sma:
+            return "BULL"
+        if last < df["l"].rolling(bw).min().iloc[-2] and last < sma:
+            return "BEAR"
+
+    return "RANGO"
+
+
+def calc_15m_data(df: pd.DataFrame) -> Dict[str, Any]:
+    """Calcula bias, fuerza y distancia ATR en 15m."""
+    default = {
+        "bias_15m": "RANGO",
+        "fuerza_15m": 0,
+        "dist_atr_15m": 0.0,
+    }
+    if df is None or len(df) < MIN_CANDLES_15M:
+        return default
+
+    last = float(df["c"].iloc[-1])
+    w20 = min(20, len(df))
+    w50 = min(50, len(df))
+    sma20 = float(df["c"].rolling(w20).mean().iloc[-1])
+    sma50 = float(df["c"].rolling(w50).mean().iloc[-1])
+
+    df = df.copy()
+    df["tr"] = np.maximum(
+        df["h"] - df["l"],
+        np.maximum(
+            abs(df["h"] - df["c"].shift(1)),
+            abs(df["l"] - df["c"].shift(1)),
+        ),
+    )
+    atr = float(df["tr"].rolling(14).mean().iloc[-1]) if len(df) >= 14 else last * 0.01
+    if atr <= 0 or not np.isfinite(atr):
+        atr = last * 0.01
+
+    bias = "RANGO"
+    if last > sma20 and sma20 > sma50:
+        bias = "BULL"
+    elif last < sma20 and sma20 < sma50:
+        bias = "BEAR"
+
+    dist_atr = abs(last - sma20) / atr if atr > 0 else 0.0
+
+    alineado = (bias == "BULL" and sma20 > sma50) or (bias == "BEAR" and sma20 < sma50)
+
+    roc = 0.0
+    if len(df) >= 5:
+        prev_c = float(df["c"].iloc[-5])
+        if prev_c > 0:
+            roc = ((last / prev_c) - 1) * 100
+
+    fuerza = 0
+    if bias == "BULL":
+        if dist_atr >= 2.0 and alineado and roc > 0.3:
+            fuerza = 3
+        elif dist_atr >= 1.0 or (alineado and roc > 0.1):
+            fuerza = 2
+        elif dist_atr >= 0.3 or roc > 0:
+            fuerza = 1
+    elif bias == "BEAR":
+        if dist_atr >= 2.0 and alineado and roc < -0.3:
+            fuerza = 3
+        elif dist_atr >= 1.0 or (alineado and roc < -0.1):
+            fuerza = 2
+        elif dist_atr >= 0.3 or roc < 0:
+            fuerza = 1
+
+    return {
+        "bias_15m": bias,
+        "fuerza_15m": fuerza,
+        "dist_atr_15m": round(dist_atr, 2),
+    }
+
+
+def calc_bias_visual(df: pd.DataFrame) -> str:
+    """Bias visual desde velas 5m. Simplificacion del scoring de zonas."""
+    if df is None or len(df) < MIN_CANDLES_5M:
+        return "RANGO"
+
+    df = df.copy()
+    last = float(df["c"].iloc[-1])
+
+    w20 = min(20, len(df))
+    w50 = min(50, len(df))
+    sma20 = float(df["c"].rolling(w20).mean().iloc[-1])
+    sma50 = float(df["c"].rolling(w50).mean().iloc[-1])
+
+    poc = float(df["c"].iloc[df["v"].idxmax()])
+    poc_score = 1 if last > poc else -1
+
+    h24 = float(df["h"].max())
+    l24 = float(df["l"].min())
+    rango = h24 - l24
+    if rango > 0:
+        tsup = h24 - (rango / 3)
+        tinf = l24 + (rango / 3)
+        if last >= tsup:
+            caja = 1
+        elif last <= tinf:
+            caja = -1
+        else:
+            caja = 0
+    else:
+        caja = 0
+
+    df["tr"] = np.maximum(
+        df["h"] - df["l"],
+        np.maximum(
+            abs(df["h"] - df["c"].shift(1)),
+            abs(df["l"] - df["c"].shift(1)),
+        ),
+    )
+    atr = float(df["tr"].rolling(14).mean().iloc[-1]) if len(df) >= 14 else last * 0.01
+    if atr <= 0 or not np.isfinite(atr):
+        atr = last * 0.01
+
+    va = float(df["v"].iloc[-1])
+    vol_avg = float(df["v"].rolling(20).mean().iloc[-1]) if len(df) >= 20 else va
+    am = min(1.0, va / (1.5 * atr)) if atr > 0 else 1.0
+    caja_p = int(round(caja * am))
+
+    delta = np.where(df["c"] >= df["o"], df["v"], -df["v"])
+    rvd_raw = float(np.sum(delta[-18:])) if len(delta) >= 18 else 0.0
+    vol_sum = float(np.sum(df["v"].iloc[-18:])) if len(df) >= 18 else 1.0
+    rvd = rvd_raw / vol_sum if vol_sum > 0 else 0.0
+    rvd = max(-1.0, min(1.0, rvd))
+    rs = 2 if rvd > 0.3 else (1 if rvd > 0.1 else (-2 if rvd < -0.3 else (-1 if rvd < -0.1 else 0)))
+
+    macro_score = poc_score + caja_p + rs
+
+    if abs(macro_score) >= STRONG_BIAS_THRESHOLD and rs == 0:
+        return "RANGO"
+    elif macro_score >= STRONG_BIAS_THRESHOLD:
+        return "BULL"
+    elif macro_score <= -STRONG_BIAS_THRESHOLD:
+        return "BEAR"
+    return "RANGO"
+
+
+def estimar_regimen_markov(df_1h: pd.DataFrame) -> Dict[str, Any]:
+    """Estimacion de regimen caotico basada en volatilidad."""
+    try:
+        if df_1h is None or len(df_1h) < 60:
+            return {"p_caos": 0.5, "estado_actual": 0}
+
+        closes = pd.to_numeric(df_1h["c"], errors="coerce").dropna()
+        if len(closes) < 60:
+            return {"p_caos": 0.5, "estado_actual": 0}
+
+        vol = closes.pct_change().dropna().abs()
+        if len(vol) < 60:
+            return {"p_caos": 0.5, "estado_actual": 0}
+
+        thr = vol.quantile(0.75)
+        states = (vol > thr).astype(int).values
+
+        counts = np.zeros((2, 2))
+        for i in range(len(states) - 1):
+            counts[states[i], states[i + 1]] += 1
+
+        prior = np.array([[0.95, 0.05], [0.10, 0.90]]) * 10
+        matriz = counts + prior
+        matriz = matriz / matriz.sum(axis=1, keepdims=True)
+
+        estado = int(states[-1])
+        p_caos = round(float(matriz[estado, 1]), 4)
+
+        return {
+            "p_caos": p_caos,
+            "estado_actual": estado,
+            "n_muestras": int(len(states)),
+        }
+    except Exception:
+        return {"p_caos": 0.5, "estado_actual": 0}
+
+
+async def ejecutar_cartografo() -> Dict[str, Dict[str, Any]]:
+    """
+    Ejecuta el analisis macro para todos los activos.
+    Retorna GEM_MACRO_CONTEXT: dict con datos por activo.
+    """
+    gem_context: Dict[str, Dict[str, Any]] = {}
+
+    async with aiohttp.ClientSession() as session:
+        tasks = {}
+        for coin in ASSETS:
+            tasks[coin] = {
+                "1h": fetch_candles(session, coin, "1h", MACRO_LOOKBACK_DAYS),
+                "15m": fetch_candles(session, coin, "15m", min(MACRO_LOOKBACK_DAYS, 7)),
+                "5m": fetch_candles(session, coin, "5m", min(MACRO_LOOKBACK_DAYS, 3)),
+            }
+
+        for coin in ASSETS:
+            try:
+                df_1h, df_15m, df_5m = await asyncio.gather(
+                    tasks[coin]["1h"],
+                    tasks[coin]["15m"],
+                    tasks[coin]["5m"],
+                    return_exceptions=True,
+                )
+
+                if isinstance(df_1h, Exception):
+                    df_1h = None
+                if isinstance(df_15m, Exception):
+                    df_15m = None
+                if isinstance(df_5m, Exception):
+                    df_5m = None
+
+                bias_1h = calc_bias_1h(df_1h)
+                data_15m = calc_15m_data(df_15m)
+                bias_visual = calc_bias_visual(df_5m)
+                regimen = estimar_regimen_markov(df_1h)
+
+                precio = 0.0
+                if df_5m is not None and len(df_5m) > 0:
+                    precio = float(df_5m["c"].iloc[-1])
+                elif df_15m is not None and len(df_15m) > 0:
+                    precio = float(df_15m["c"].iloc[-1])
+
+                gem_context[coin] = {
+                    "bias_1h": bias_1h,
+                    "bias_15m": data_15m["bias_15m"],
+                    "bias_visual": bias_visual,
+                    "fuerza_15m": data_15m["fuerza_15m"],
+                    "dist_atr_15m": data_15m["dist_atr_15m"],
+                    "regimen": regimen,
+                    "precio_ejecucion": precio,
+                    "timestamp": int(time.time()),
+                }
+
+            except Exception as e:
+                print(f"  WARNING Error procesando {coin}: {e}")
+                gem_context[coin] = {
+                    "bias_1h": "RANGO",
+                    "bias_15m": "RANGO",
+                    "bias_visual": "RANGO",
+                    "fuerza_15m": 0,
+                    "dist_atr_15m": 0.0,
+                    "regimen": {"p_caos": 0.5, "estado_actual": 0},
+                    "precio_ejecucion": 0.0,
+                    "timestamp": int(time.time()),
+                }
+
+    return gem_context
+
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("CARTOGRAFO SIMPLIFICADO")
+    print("=" * 60)
+    print(f"   Activos: {ASSETS}")
+    print(f"   API: {HL_REST_URL}")
+    print()
+
+    result = asyncio.run(ejecutar_cartografo())
+
+    for coin, ctx in result.items():
+        regimen = ctx.get("regimen", {})
+        print(f"  {coin}:")
+        print(f"    1H: {ctx['bias_1h']}")
+        print(f"    15m: {ctx['bias_15m']} | FZA: {ctx['fuerza_15m']}/3 | DIST: {ctx['dist_atr_15m']}x")
+        print(f"    5m (visual): {ctx['bias_visual']}")
+        print(f"    CAOS: {regimen.get('p_caos', 0):.2f}")
+        print(f"    Precio: ${ctx['precio_ejecucion']:,.2f}")
+        print()
+
+    print("=" * 60)
+    print(f"Cartografo completado. {len(result)} activos analizados.")
+    print("=" * 60)

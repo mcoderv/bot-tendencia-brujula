@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+aiohttp
+pandas
+numpy
+python-dotenv
+jinja2
