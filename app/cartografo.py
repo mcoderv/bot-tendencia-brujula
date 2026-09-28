@@ -1,8 +1,8 @@
 """
-Cartografo simplificado para Bot Tendencia.
-Fetch de datos Hyperliquid + calculo de bias multi-timeframe.
+Cartógrafo simplificado para Bot Tendencia.
+Fetch de datos Hyperliquid + cálculo de bias multi-timeframe.
 Sin statsmodels (ADF/FFD omitidos). Solo 3 activos.
-Retorna GEM_MACRO_CONTEXT que consume la Brujula.
+Retorna GEM_MACRO_CONTEXT que consume la Brújula.
 """
 import asyncio
 import aiohttp
@@ -13,7 +13,7 @@ from typing import Dict, Any, Optional
 
 from app.config import ASSETS, HL_REST_URL
 
-# Parametros del Cartografo
+# Parámetros del Cartógrafo
 MACRO_LOOKBACK_DAYS = 30
 REST_API_TIMEOUT = 10
 SMA_TREND_PERIOD = 50
@@ -24,6 +24,68 @@ MIN_CANDLES_5M = 200
 STRONG_BIAS_THRESHOLD = 2
 
 
+# ══════════════════════════════════════════════════════════════════════
+# FETCH SOLO PRECIOS (reusa el mismo payload que fetch_candles)
+# ══════════════════════════════════════════════════════════════════════
+async def _fetch_last_price(
+    session: aiohttp.ClientSession,
+    coin: str
+) -> tuple:
+    """
+    Fetch de la última vela de 5m usando el mismo patrón que fetch_candles.
+    Retorna (precio, error).
+    """
+    st_time = int((time.time() - 900) * 1000)  # 15 minutos atrás
+    payload = {
+        "type": "candleSnapshot",
+        "req": {
+            "coin": coin,
+            "interval": "5m",
+            "startTime": st_time,
+        },
+    }
+    try:
+        async with session.post(
+            HL_REST_URL,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as resp:
+            data = await resp.json()
+            if isinstance(data, list) and len(data) > 0:
+                last_price = float(data[-1].get("c", 0))
+                return (last_price, None)
+            return (0.0, "Sin datos")
+    except asyncio.TimeoutError:
+        return (0.0, "Timeout (5s)")
+    except Exception as e:
+        return (0.0, f"{type(e).__name__}: {str(e)[:80]}")
+
+
+async def fetch_precios_rapidos() -> Dict[str, Dict[str, Any]]:
+    """
+    Fetch ligero: último precio de cada activo en paralelo.
+    Reusa el mismo payload probado en fetch_candles.
+    Tiempo estimado: ~200ms total.
+    """
+    precios = {}
+    async with aiohttp.ClientSession() as session:
+        tasks = [_fetch_last_price(session, coin) for coin in ASSETS]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for i, coin in enumerate(ASSETS):
+            result = results[i]
+            if isinstance(result, Exception):
+                precios[coin] = {"precio": 0.0, "error": str(result)}
+            else:
+                precio, error = result
+                precios[coin] = {"precio": precio, "error": error}
+
+    return precios
+
+
+# ══════════════════════════════════════════════════════════════════════
+# FETCH DE VELAS (existente, sin cambios)
+# ══════════════════════════════════════════════════════════════════════
 async def fetch_candles(
     session: aiohttp.ClientSession,
     coin: str,
@@ -336,6 +398,17 @@ if __name__ == "__main__":
     print(f"   API: {HL_REST_URL}")
     print()
 
+    # Test de precios rápidos
+    print("🔍 Test fetch_precios_rapidos...")
+    precios = asyncio.run(fetch_precios_rapidos())
+    for coin, data in precios.items():
+        if data["error"]:
+            print(f"  {coin}: ERROR - {data['error']}")
+        else:
+            print(f"  {coin}: ${data['precio']:,.2f}")
+    print()
+
+    # Test de cartógrafo completo
     result = asyncio.run(ejecutar_cartografo())
 
     for coin, ctx in result.items():

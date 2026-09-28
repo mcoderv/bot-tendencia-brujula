@@ -1,65 +1,58 @@
 """
-Configuración centralizada del Bot Tendencia.
-Adaptado de mercabot_qwen Celdas 1 y 1.5 para VS Code + FastAPI.
-Solo 3 activos: BTC, ETH, SOL. Sin Google Drive. Sin Colab.
+Configuración centralizada para Bot Tendencia - Brujula MTF.
+Todas las variables de entorno y constantes del sistema.
 """
 import os
-from dotenv import load_dotenv
+from typing import List
 
-# ── Cargar variables de entorno desde .env ──
-load_dotenv()
+# ── Variables de entorno ──
+TZ_NAME: str = os.getenv("TZ_NAME", "America/Caracas")
+HL_REST_URL: str = os.getenv("HL_REST_URL", "https://api.hyperliquid.xyz/info")
 
-# ── CONFIG: Configuración global simplificada ──
-TZ_NAME = os.getenv("TZ_NAME", "America/Caracas")
-HL_REST_URL = os.getenv("HL_REST_URL", "https://api.hyperliquid.xyz/info")
-
-# ── Activos ──
+# Activos a monitorear (lista desde variable de entorno separada por comas)
 _assets_env = os.getenv("ASSETS", "BTC,ETH,SOL")
-ASSETS = [a.strip() for a in _assets_env.split(",")]
+ASSETS: List[str] = [a.strip() for a in _assets_env.split(",") if a.strip()]
 
-# ── CENTRAL_PARAMS simplificado (solo lo que usa la Brújula) ──
-CENTRAL_PARAMS = {
-    "system": {
-        "TZ_NAME": TZ_NAME,
-        "HL_REST_URL": HL_REST_URL,
-        "WATCHLIST": list(ASSETS),
-    },
-    "macro": {
-        "ALL_ASSETS": list(ASSETS),
-        "BIAS_THRESHOLD": 0.60,
-        "REST_API_TIMEOUT": 10,
-    },
-    "markov": {
-        "ACTIVADO": True,
-        "PROBABILIDAD_BLOQUEO_ALTCOIN": 0.75,
-    },
-}
-# ── Thresholds de la Brújula v4.0 ──
-FUERZA_FUERTE = 2
-FUERZA_DEBIL = 1
-DIST_EXTENDIDA = 2.0
-DIST_MODERADA = 1.0
-MK_BLOQUEO = float(CENTRAL_PARAMS["markov"]["PROBABILIDAD_BLOQUEO_ALTCOIN"])
+# ── Cache ──
+# Tiempo en segundos antes de recalcular el estado completo
+# Reducido de 300s a 60s para refresh más frecuente en la web
+CACHE_TTL: int = int(os.getenv("CACHE_TTL", "60"))
 
-# ── Refresco visual (segundos entre pings de UptimeRobot) ──
-REFRESH_SEG = 10
+# Tiempo en segundos para precios rápidos (endpoint /api/prices)
+CACHE_TTL_PRECIOS: int = int(os.getenv("CACHE_TTL_PRECIOS", "30"))
 
-# ── Información 24/7 ──
-INFO_247_TXT = (
-    "🌐 Hyperliquid opera 24/7: los perps TradFi (xyz:) cotizan "
-    "aunque el mercado subyacente esté cerrado."
+# ── Thresholds del motor de decisión (Brujula v4.1) ──
+# Probabilidad de caos que bloquea cualquier operación
+MK_BLOQUEO: float = 0.75
+
+# Fuerza mínima para considerar señal fuerte
+FUERZA_FUERTE: int = 2
+FUERZA_DEBIL: int = 1
+
+# Distancia al ATR (en múltiplos)
+DIST_EXTENDIDA: float = 2.0
+DIST_MODERADA: float = 1.0
+
+# ── UI ──
+REFRESH_SEG: int = 30  # Frecuencia de refresh del frontend (ms se calculan en JS)
+
+# Texto informativo sobre mercados 24/7
+INFO_247_TXT: str = (
+    "🌐 Hyperliquid opera 24/7: los perps TradFi (xyz:) "
+    "cotizan aunque el mercado subyacente esté cerrado."
 )
-# ── Banner de verificación ──
-def print_config():
-    print("=" * 60)
-    print("🦅 BOT TENDENCIA | CONFIG")
-    print("=" * 60)
-    print(f"✅ TZ_NAME: {TZ_NAME}")
-    print(f"✅ HL_REST_URL: {HL_REST_URL}")
-    print(f"✅ ASSETS: {ASSETS}")
-    print(f"✅ MK_BLOQUEO: {MK_BLOQUEO}")
-    print(f"✅ REFRESH_SEG: {REFRESH_SEG}")
-    print("=" * 60)
 
+# ── Validación al importar ──
 if __name__ == "__main__":
-    print_config()
+    print("=" * 60)
+    print("CONFIGURACIÓN BOT TENDENCIA")
+    print("=" * 60)
+    print(f"  TZ_NAME:        {TZ_NAME}")
+    print(f"  HL_REST_URL:    {HL_REST_URL}")
+    print(f"  ASSETS:         {ASSETS}")
+    print(f"  CACHE_TTL:      {CACHE_TTL}s")
+    print(f"  CACHE_TTL_PRECIOS: {CACHE_TTL_PRECIOS}s")
+    print(f"  MK_BLOQUEO:     {MK_BLOQUEO}")
+    print(f"  FUERZA_FUERTE:  {FUERZA_FUERTE}")
+    print(f"  DIST_EXTENDIDA: {DIST_EXTENDIDA}x")
+    print("=" * 60)
