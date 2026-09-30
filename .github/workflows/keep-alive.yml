@@ -1,0 +1,22 @@
+name: Keep Render Alive
+
+on:
+  schedule:
+    # Ejecutar cada 5 minutos
+    - cron: '*/5 * * * *'
+  workflow_dispatch:  # Permite ejecutar manualmente desde la UI
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /tick endpoint
+        run: |
+          echo "Pinging bot-tendencia-brujula.onrender.com/tick at $(date)"
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" https://bot-tendencia-brujula.onrender.com/tick)
+          echo "Response code: $HTTP_CODE"
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "⚠️ Endpoint returned non-200 status"
+            exit 1
+          fi
+          echo "✅ Ping successful"
