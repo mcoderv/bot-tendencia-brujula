@@ -1,7 +1,7 @@
 """
 FastAPI app para Bot Tendencia - Brujula MTF.
 Sirve el dashboard como pagina web bajo demanda.
-v4.6: Countdown 30s + polling de precios en vivo.
+v4.7: Integración completa con Signal Aggregator, Turso y Telegram.
 """
 import time
 from fastapi import FastAPI
@@ -9,15 +9,16 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from app.cartografo import ejecutar_cartografo, fetch_precios_rapidos
 from app.brujula import render_brujula
+from app.signal_aggregator import evaluar_y_ejecutar_senales
 from app.config import ASSETS, TZ_NAME, HL_REST_URL, CACHE_TTL, CACHE_TTL_PRECIOS
 
 app = FastAPI(
     title="Bot Tendencia - Brujula MTF",
     description="Dashboard on-demand para analisis multi-timeframe de crypto",
-    version="4.6.0",
+    version="4.7.0",
 )
 
-# Cache separado para estado completo y precios
+# Cache separado para estado completo, precios y señales
 _cache = {
     "gem_context": None,
     "timestamp": 0.0,
@@ -29,6 +30,11 @@ _cache_html = {
 }
 
 _cache_precios = {
+    "data": None,
+    "timestamp": 0.0,
+}
+
+_cache_senales = {
     "data": None,
     "timestamp": 0.0,
 }
@@ -45,10 +51,8 @@ async def api_prices():
     """
     Endpoint ligero: solo precios actuales de los activos.
     Cache de 30s para refresh frecuente sin saturar Hyperliquid.
-    Usado por el frontend para actualizar precios en vivo.
     """
     now = time.time()
-    
     if _cache_precios["data"] is None or (now - _cache_precios["timestamp"]) > CACHE_TTL_PRECIOS:
         _cache_precios["data"] = await fetch_precios_rapidos()
         _cache_precios["timestamp"] = now
@@ -65,11 +69,11 @@ async def api_prices():
 async def api_data():
     """Retorna los datos crudos del Cartografo en JSON (estado completo)."""
     now = time.time()
-    
     if _cache["gem_context"] is None or (now - _cache["timestamp"]) > CACHE_TTL:
         _cache["gem_context"] = await ejecutar_cartografo()
         _cache["timestamp"] = now
         _cache_html["html"] = None
+        _cache_senales["data"] = None  # Invalidar cache de señales también
 
     return JSONResponse(content={
         "assets": ASSETS,
@@ -83,18 +87,31 @@ async def api_data():
 async def index():
     """Pagina principal - renderiza la Brujula."""
     now = time.time()
-
-    # Paso 1: asegurar que gem_context esté actualizado
+    
+    # Paso 1: asegurar que gem_context y señales estén actualizados
     if _cache["gem_context"] is None or (now - _cache["timestamp"]) > CACHE_TTL:
+        t0 = time.time()
         _cache["gem_context"] = await ejecutar_cartografo()
         _cache["timestamp"] = now
         _cache_html["html"] = None
         _cache_html["gem_timestamp"] = _cache["timestamp"]
+        
+        # Ejecutar Signal Aggregator (Turso + Telegram)
+        print("\n🔄 Ejecutando Signal Aggregator (Turso + Telegram)...")
+        try:
+            # Esta función decide LONG/SHORT/NEUTRAL, guarda en Turso y envía a Telegram si hay cambio
+            _cache_senales["data"] = await evaluar_y_ejecutar_senales()
+            _cache_senales["timestamp"] = now
+            print("✅ Signal Aggregator completado")
+        except Exception as e:
+            print(f"❌ Error en Signal Aggregator: {e}")
+            _cache_senales["data"] = None
 
     # Paso 2: asegurar que el HTML esté generado
     if _cache_html["html"] is None:
         t0 = time.time()
-        base_html = render_brujula(_cache["gem_context"])
+        # Pasar las señales al renderizador para el panel de acción
+        base_html = render_brujula(_cache["gem_context"], _cache_senales["data"])
         elapsed = time.time() - t0
         footer = (
             f'<div style="text-align:center;color:#768390;font-size:12px;margin-top:8px;">'
@@ -105,34 +122,30 @@ async def index():
 
     # Paso 3: JavaScript para countdown + polling de precios
     js_code = f"""
-<script>
-(function() {{
-    var countdown = {CACHE_TTL_PRECIOS};
-    var countdownEl = null;
-
-    function formatPrice(p) {{
-        if (p <= 0) return '—';
-        if (p >= 1000) return '$' + p.toLocaleString('en-US', {{maximumFractionDigits: 0}});
-        if (p >= 1) return '$' + p.toLocaleString('en-US', {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
-        return '$' + p.toLocaleString('en-US', {{minimumFractionDigits: 4, maximumFractionDigits: 4}});
-    }}
-
-    function crearCountdown() {{
-        var container = document.createElement('div');
-        container.style.cssText = 'position:fixed;top:10px;right:10px;background:#1a1a2e;border:1px solid #30363d;border-radius:6px;padding:6px 12px;color:#768390;font-size:12px;font-family:ui-monospace,Consolas,monospace;z-index:9999;';
-        countdownEl = container;
-        document.body.appendChild(container);
-        updateCountdown();
-    }}
-
-    function updateCountdown() {{
-        if (countdownEl) {{
-            countdownEl.textContent = '⏱ Refresh precios: ' + countdown + 's';
+    <script>
+    (function() {{
+        var countdown = {CACHE_TTL_PRECIOS};
+        var countdownEl = null;
+        function formatPrice(p) {{
+            if (p <= 0) return '—';
+            if (p >= 1000) return '$' + p.toLocaleString('en-US', {{maximumFractionDigits: 0}});
+            if (p >= 1) return '$' + p.toLocaleString('en-US', {{minimumFractionDigits: 2, maximumFractionDigits: 2}});
+            return '$' + p.toLocaleString('en-US', {{minimumFractionDigits: 4, maximumFractionDigits: 4}});
         }}
-    }}
-
-    function fetchPrices() {{
-        fetch('/api/prices')
+        function crearCountdown() {{
+            var container = document.createElement('div');
+            container.style.cssText = 'position:fixed;top:10px;right:10px;background:#1a1a2e;border:1px solid #30363d;border-radius:6px;padding:6px 12px;color:#768390;font-size:12px;font-family:ui-monospace,Consolas,monospace;z-index:9999;';
+            countdownEl = container;
+            document.body.appendChild(container);
+            updateCountdown();
+        }}
+        function updateCountdown() {{
+            if (countdownEl) {{
+                countdownEl.textContent = '⏱ Refresh precios: ' + countdown + 's';
+            }}
+        }}
+        function fetchPrices() {{
+            fetch('/api/prices')
             .then(function(r) {{ return r.json(); }})
             .then(function(data) {{
                 var prices = data.prices || {{}};
@@ -148,30 +161,27 @@ async def index():
             .catch(function(err) {{
                 console.warn('Error fetching prices:', err);
             }});
-    }}
-
-    function tick() {{
-        countdown--;
-        if (countdown <= 0) {{
-            fetchPrices();
-            countdown = {CACHE_TTL_PRECIOS};
         }}
-        updateCountdown();
-    }}
-
-    // Inicializar cuando el DOM esté listo
-    if (document.readyState === 'loading') {{
-        document.addEventListener('DOMContentLoaded', function() {{
+        function tick() {{
+            countdown--;
+            if (countdown <= 0) {{
+                fetchPrices();
+                countdown = {CACHE_TTL_PRECIOS};
+            }}
+            updateCountdown();
+        }}
+        if (document.readyState === 'loading') {{
+            document.addEventListener('DOMContentLoaded', function() {{
+                crearCountdown();
+                setInterval(tick, 1000);
+            }});
+        }} else {{
             crearCountdown();
             setInterval(tick, 1000);
-        }});
-    }} else {{
-        crearCountdown();
-        setInterval(tick, 1000);
-    }}
-}})();
-</script>
-"""
+        }}
+    }})();
+    </script>
+    """
 
     # Paso 4: wrapper HTML completo
     page = (
@@ -196,13 +206,13 @@ async def index():
 if __name__ == "__main__":
     import uvicorn
     print("=" * 60)
-    print("BOT TENDENCIA - BRUJULA MTF v4.6")
+    print("BOT TENDENCIA - BRUJULA MTF v4.7")
     print("=" * 60)
     print(f"  Activos: {ASSETS}")
     print(f"  API: {HL_REST_URL}")
     print(f"  TZ: {TZ_NAME}")
     print(f"  Abriendo en http://127.0.0.1:8000")
     print(f"  Precios en vivo: cada {CACHE_TTL_PRECIOS}s")
-    print(f"  Análisis MTF: cada {CACHE_TTL}s")
+    print(f"  Análisis MTF + Señales: cada {CACHE_TTL}s")
     print("=" * 60)
     uvicorn.run(app, host="127.0.0.1", port=8000)

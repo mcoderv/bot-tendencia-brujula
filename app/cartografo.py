@@ -3,6 +3,8 @@ Cartógrafo simplificado para Bot Tendencia.
 Fetch de datos Hyperliquid + cálculo de bias multi-timeframe.
 Sin statsmodels (ADF/FFD omitidos). Solo 3 activos.
 Retorna GEM_MACRO_CONTEXT que consume la Brújula.
+
+v4.8: Datos reales para h24, l24, sma20_15m (antes eran inventados).
 """
 import asyncio
 import aiohttp
@@ -25,7 +27,7 @@ STRONG_BIAS_THRESHOLD = 2
 
 
 # ══════════════════════════════════════════════════════════════════════
-# FETCH SOLO PRECIOS (reusa el mismo payload que fetch_candles)
+# FETCH SOLO PRECIOS (ligero para /api/prices)
 # ══════════════════════════════════════════════════════════════════════
 async def _fetch_last_price(
     session: aiohttp.ClientSession,
@@ -84,7 +86,7 @@ async def fetch_precios_rapidos() -> Dict[str, Dict[str, Any]]:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# FETCH DE VELAS (existente, sin cambios)
+# FETCH DE VELAS (sin cambios)
 # ══════════════════════════════════════════════════════════════════════
 async def fetch_candles(
     session: aiohttp.ClientSession,
@@ -152,11 +154,15 @@ def calc_bias_1h(df: pd.DataFrame) -> str:
 
 
 def calc_15m_data(df: pd.DataFrame) -> Dict[str, Any]:
-    """Calcula bias, fuerza y distancia ATR en 15m."""
+    """
+    Calcula bias, fuerza, distancia ATR y SMA20 en 15m.
+    v4.8: ahora retorna también sma20_15m (real, no inventado).
+    """
     default = {
         "bias_15m": "RANGO",
         "fuerza_15m": 0,
         "dist_atr_15m": 0.0,
+        "sma20_15m": 0.0,
     }
     if df is None or len(df) < MIN_CANDLES_15M:
         return default
@@ -215,7 +221,27 @@ def calc_15m_data(df: pd.DataFrame) -> Dict[str, Any]:
         "bias_15m": bias,
         "fuerza_15m": fuerza,
         "dist_atr_15m": round(dist_atr, 2),
+        "sma20_15m": round(sma20, 6),  # REAL, calculado desde el DataFrame
     }
+
+
+def calc_h24_l24(df_1h: pd.DataFrame) -> tuple:
+    """
+    Calcula el máximo y mínimo de las últimas 24 horas usando velas de 1H.
+    Usa las últimas 24 velas (cada una = 1 hora) para h24 y l24 reales.
+    Retorna (h24, l24).
+    """
+    if df_1h is None or len(df_1h) == 0:
+        return (0.0, 0.0)
+
+    # Tomar las últimas 24 velas (o todas si hay menos)
+    n = min(24, len(df_1h))
+    last_24h = df_1h.tail(n)
+
+    h24 = float(last_24h["h"].max())
+    l24 = float(last_24h["l"].min())
+
+    return (h24, l24)
 
 
 def calc_bias_visual(df: pd.DataFrame) -> str:
@@ -323,6 +349,7 @@ def estimar_regimen_markov(df_1h: pd.DataFrame) -> Dict[str, Any]:
 async def ejecutar_cartografo() -> Dict[str, Dict[str, Any]]:
     """
     Ejecuta el analisis macro para todos los activos.
+    v4.8: incluye h24, l24, sma20_15m reales.
     Retorna GEM_MACRO_CONTEXT: dict con datos por activo.
     """
     gem_context: Dict[str, Dict[str, Any]] = {}
@@ -357,6 +384,9 @@ async def ejecutar_cartografo() -> Dict[str, Dict[str, Any]]:
                 bias_visual = calc_bias_visual(df_5m)
                 regimen = estimar_regimen_markov(df_1h)
 
+                # Calcular h24 y l24 reales desde velas de 1H (últimas 24h)
+                h24, l24 = calc_h24_l24(df_1h)
+
                 precio = 0.0
                 if df_5m is not None and len(df_5m) > 0:
                     precio = float(df_5m["c"].iloc[-1])
@@ -369,6 +399,9 @@ async def ejecutar_cartografo() -> Dict[str, Dict[str, Any]]:
                     "bias_visual": bias_visual,
                     "fuerza_15m": data_15m["fuerza_15m"],
                     "dist_atr_15m": data_15m["dist_atr_15m"],
+                    "sma20_15m": data_15m["sma20_15m"],  # NUEVO: valor real
+                    "h24": h24,                          # NUEVO: valor real
+                    "l24": l24,                          # NUEVO: valor real
                     "regimen": regimen,
                     "precio_ejecucion": precio,
                     "timestamp": int(time.time()),
@@ -382,6 +415,9 @@ async def ejecutar_cartografo() -> Dict[str, Dict[str, Any]]:
                     "bias_visual": "RANGO",
                     "fuerza_15m": 0,
                     "dist_atr_15m": 0.0,
+                    "sma20_15m": 0.0,
+                    "h24": 0.0,
+                    "l24": 0.0,
                     "regimen": {"p_caos": 0.5, "estado_actual": 0},
                     "precio_ejecucion": 0.0,
                     "timestamp": int(time.time()),
@@ -392,7 +428,7 @@ async def ejecutar_cartografo() -> Dict[str, Dict[str, Any]]:
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("CARTOGRAFO SIMPLIFICADO")
+    print("CARTOGRAFO SIMPLIFICADO v4.8")
     print("=" * 60)
     print(f"   Activos: {ASSETS}")
     print(f"   API: {HL_REST_URL}")
@@ -416,6 +452,8 @@ if __name__ == "__main__":
         print(f"  {coin}:")
         print(f"    1H: {ctx['bias_1h']}")
         print(f"    15m: {ctx['bias_15m']} | FZA: {ctx['fuerza_15m']}/3 | DIST: {ctx['dist_atr_15m']}x")
+        print(f"    SMA20_15m: ${ctx['sma20_15m']:,.2f} (REAL)")
+        print(f"    h24: ${ctx['h24']:,.2f} | l24: ${ctx['l24']:,.2f} (REALES)")
         print(f"    5m (visual): {ctx['bias_visual']}")
         print(f"    CAOS: {regimen.get('p_caos', 0):.2f}")
         print(f"    Precio: ${ctx['precio_ejecucion']:,.2f}")
