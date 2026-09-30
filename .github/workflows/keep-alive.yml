@@ -1,0 +1,22 @@
+name: Keep Render Alive
+
+on:
+  schedule:
+    # Cada 15 minutos (para no exceder límite gratuito de repos privados)
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /tick endpoint
+        run: |
+          echo "Pinging at $(date)"
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" https://bot-tendencia-brujula.onrender.com/tick)
+          echo "Response: $HTTP_CODE"
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "⚠️ Non-200 response"
+            exit 1
+          fi
+          echo "✅ OK"
