@@ -1,9 +1,15 @@
 """
 FastAPI app para Bot Tendencia - Brujula MTF.
 Sirve el dashboard como pagina web bajo demanda.
-v4.7: Integración completa con Signal Aggregator, Turso y Telegram.
+
+v5.0: Scheduler interno cada 60s + endpoint /tick para UptimeRobot.
+      - Las señales se evalúan automáticamente aunque nadie visite la web.
+      - UptimeRobot llama a /tick cada 5 min para mantener Render despierto.
+      - El scheduler interno corre mientras el servicio esté activo.
 """
 import time
+import asyncio
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 
@@ -12,13 +18,66 @@ from app.brujula import render_brujula
 from app.signal_aggregator import evaluar_y_ejecutar_senales
 from app.config import ASSETS, TZ_NAME, HL_REST_URL, CACHE_TTL, CACHE_TTL_PRECIOS
 
+# ── Intervalo del scheduler interno (segundos) ──
+SCHEDULER_INTERVAL = 60
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SCHEDULER INTERNO: ejecuta Signal Aggregator cada 60s en background
+# ══════════════════════════════════════════════════════════════════════
+async def signal_scheduler():
+    """
+    Bucle infinito que ejecuta Signal Aggregator cada SCHEDULER_INTERVAL segundos.
+    Corre en background mientras el servicio esté activo.
+    Si Render duerme el servicio (15 min sin tráfico), este bucle también se detiene,
+    pero UptimeRobot lo despertará cada 5 min llamando a /tick.
+    """
+    # Espera inicial para dejar que Uvicorn termine de arrancar
+    await asyncio.sleep(5)
+    print(f"✅ Scheduler de señales iniciado (cada {SCHEDULER_INTERVAL}s)")
+
+    while True:
+        try:
+            print(f"\n⏰ [{time.strftime('%H:%M:%S')}] Scheduler ejecutando Signal Aggregator...")
+            t0 = time.time()
+            senales = await evaluar_y_ejecutar_senales()
+            elapsed = time.time() - t0
+            print(f"✅ [{time.strftime('%H:%M:%S')}] Scheduler completado en {elapsed:.1f}s — {len(senales)} activos evaluados")
+        except asyncio.CancelledError:
+            print("🛑 Scheduler detenido por cancelación")
+            break
+        except Exception as e:
+            print(f"❌ [{time.strftime('%H:%M:%S')}] Error en scheduler: {type(e).__name__}: {e}")
+
+        # Espera al siguiente ciclo
+        await asyncio.sleep(SCHEDULER_INTERVAL)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# LIFESPAN: inicia el scheduler al arrancar la aplicación
+# ══════════════════════════════════════════════════════════════════════
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Inicia el scheduler al arrancar y lo detiene al cerrar."""
+    # Startup
+    task = asyncio.create_task(signal_scheduler())
+    yield
+    # Shutdown
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
 app = FastAPI(
     title="Bot Tendencia - Brujula MTF",
-    description="Dashboard on-demand para analisis multi-timeframe de crypto",
-    version="4.7.0",
+    description="Dashboard on-demand + scheduler para señales 24/7",
+    version="5.0.0",
+    lifespan=lifespan,
 )
 
-# Cache separado para estado completo, precios y señales
+# ── Cache compartido ──
 _cache = {
     "gem_context": None,
     "timestamp": 0.0,
@@ -40,18 +99,45 @@ _cache_senales = {
 }
 
 
+# ══════════════════════════════════════════════════════════════════════
+# ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════
+
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
-    """Endpoint para UptimeRobot - respuesta rapida. Acepta GET y HEAD."""
+    """Endpoint para UptimeRobot - respuesta rapida."""
     return {"status": "ok", "service": "bot-tendencia-brujula"}
+
+
+@app.get("/tick")
+async def tick():
+    """
+    Endpoint para UptimeRobot (llamado cada 5 min).
+    Ejecuta Signal Aggregator manualmente para asegurar que Telegram
+    reciba señales incluso si Render estaba dormido.
+    """
+    try:
+        t0 = time.time()
+        senales = await evaluar_y_ejecutar_senales()
+        elapsed = time.time() - t0
+        print(f"✅ [/tick] Signal Aggregator completado en {elapsed:.1f}s — {len(senales)} activos")
+        return {
+            "status": "ok",
+            "elapsed_seconds": round(elapsed, 2),
+            "assets_evaluated": len(senales),
+            "timestamp": int(time.time()),
+        }
+    except Exception as e:
+        print(f"❌ [/tick] Error: {type(e).__name__}: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e)},
+        )
 
 
 @app.api_route("/api/prices", methods=["GET", "HEAD"])
 async def api_prices():
-    """
-    Endpoint ligero: solo precios actuales de los activos.
-    Cache de 30s para refresh frecuente sin saturar Hyperliquid.
-    """
+    """Endpoint ligero: solo precios actuales (cache 30s)."""
     now = time.time()
     if _cache_precios["data"] is None or (now - _cache_precios["timestamp"]) > CACHE_TTL_PRECIOS:
         _cache_precios["data"] = await fetch_precios_rapidos()
@@ -67,13 +153,13 @@ async def api_prices():
 
 @app.get("/api/data")
 async def api_data():
-    """Retorna los datos crudos del Cartografo en JSON (estado completo)."""
+    """Retorna los datos crudos del Cartografo en JSON."""
     now = time.time()
     if _cache["gem_context"] is None or (now - _cache["timestamp"]) > CACHE_TTL:
         _cache["gem_context"] = await ejecutar_cartografo()
         _cache["timestamp"] = now
         _cache_html["html"] = None
-        _cache_senales["data"] = None  # Invalidar cache de señales también
+        _cache_senales["data"] = None
 
     return JSONResponse(content={
         "assets": ASSETS,
@@ -87,35 +173,31 @@ async def api_data():
 async def index():
     """Pagina principal - renderiza la Brujula."""
     now = time.time()
-    
-    # Paso 1: asegurar que gem_context y señales estén actualizados
+
+    # Paso 1: asegurar que gem_context esté actualizado
     if _cache["gem_context"] is None or (now - _cache["timestamp"]) > CACHE_TTL:
         t0 = time.time()
         _cache["gem_context"] = await ejecutar_cartografo()
         _cache["timestamp"] = now
         _cache_html["html"] = None
-        _cache_html["gem_timestamp"] = _cache["timestamp"]
-        
-        # Ejecutar Signal Aggregator (Turso + Telegram)
-        print("\n🔄 Ejecutando Signal Aggregator (Turso + Telegram)...")
+
+        # El Signal Aggregator ya corre en el scheduler cada 60s,
+        # pero lo ejecutamos también aquí para refrescar el cache de señales
         try:
-            # Esta función decide LONG/SHORT/NEUTRAL, guarda en Turso y envía a Telegram si hay cambio
             _cache_senales["data"] = await evaluar_y_ejecutar_senales()
             _cache_senales["timestamp"] = now
-            print("✅ Signal Aggregator completado")
         except Exception as e:
-            print(f"❌ Error en Signal Aggregator: {e}")
+            print(f"❌ Error en Signal Aggregator (index): {e}")
             _cache_senales["data"] = None
 
     # Paso 2: asegurar que el HTML esté generado
     if _cache_html["html"] is None:
         t0 = time.time()
-        # Pasar las señales al renderizador para el panel de acción
         base_html = render_brujula(_cache["gem_context"], _cache_senales["data"])
         elapsed = time.time() - t0
         footer = (
             f'<div style="text-align:center;color:#768390;font-size:12px;margin-top:8px;">'
-            f'Calculado en {elapsed:.1f}s · Cache {CACHE_TTL}s · Precios cada {CACHE_TTL_PRECIOS}s</div>'
+            f'Calculado en {elapsed:.1f}s · Cache {CACHE_TTL}s · Precios cada {CACHE_TTL_PRECIOS}s · Scheduler cada {SCHEDULER_INTERVAL}s</div>'
         )
         _cache_html["html"] = base_html + footer
         _cache_html["gem_timestamp"] = _cache["timestamp"]
@@ -206,13 +288,14 @@ async def index():
 if __name__ == "__main__":
     import uvicorn
     print("=" * 60)
-    print("BOT TENDENCIA - BRUJULA MTF v4.7")
+    print("BOT TENDENCIA - BRUJULA MTF v5.0")
     print("=" * 60)
     print(f"  Activos: {ASSETS}")
     print(f"  API: {HL_REST_URL}")
     print(f"  TZ: {TZ_NAME}")
     print(f"  Abriendo en http://127.0.0.1:8000")
     print(f"  Precios en vivo: cada {CACHE_TTL_PRECIOS}s")
-    print(f"  Análisis MTF + Señales: cada {CACHE_TTL}s")
+    print(f"  Scheduler interno: cada {SCHEDULER_INTERVAL}s")
+    print(f"  Endpoint /tick: para UptimeRobot cada 5 min")
     print("=" * 60)
     uvicorn.run(app, host="127.0.0.1", port=8000)
