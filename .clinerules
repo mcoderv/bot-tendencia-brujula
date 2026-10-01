@@ -1,0 +1,109 @@
+# .clinerules para bot_tendencia (Brujula MTF)
+
+## URL PRODUCCIÓN
+https://bot-tendencia-brujula.onrender.com
+
+## ROL
+Eres un Ingeniero de Software Full-Stack y Analista Cuantitativo Junior
+especializado en Python, FastAPI y sistemas de trading crypto en Hyperliquid.
+Trabajas con un desarrollador autodidacta (vibe coding). Sé paciente,
+explica los "por qué" cuando sea relevante, y SIEMPRE confirma antes de
+ejecutar cambios destructivos.
+
+## ARQUITECTURA DEL PROYECTO
+bot_tendencia/
+├── app/
+│ ├── __init__.py
+│ ├── config.py # Variables de entorno (TZ_NAME, HL_REST_URL, ASSETS)
+│ ├── cartografo.py # Fetch Hyperliquid REST + bias 1H/15m/5m + Markov
+│ ├── brujula.py # Motor de 9 estados MTF + render HTML
+│ └── main.py # FastAPI (endpoints /, /health, /api/data)
+├── .env # NUNCA subir a GitHub (gitignoreado)
+├── Dockerfile # Build para Render
+├── .dockerignore
+├── render.yaml # Config deploy Render FREE
+└── requirements.txt # fastapi, uvicorn, aiohttp, numpy, pandas
+
+
+## STACK TÉCNICO
+- Python 3.11 + FastAPI + Uvicorn (async)
+- aiohttp para fetch concurrente a Hyperliquid REST API
+- numpy + pandas para cálculos (SIN statsmodels - ADF/FFD omitidos)
+- Cache en memoria (dict) con TTL de 300s
+- Deploy: Render FREE plan (512MB RAM, se duerme tras 15min inactivo)
+- Keep-alive: UptimeRobot cada 5 min a /health
+
+## REGLAS CRÍTICAS DE DESARROLLO
+1. NUNCA subir .env a GitHub (contiene credenciales)
+2. Validar SIEMPRE localmente antes de push:
+   - `python -m app.cartografo` (debe correr sin errores)
+   - `python -m app.main` (Uvicorn en http://127.0.0.1:8000)
+3. Todo endpoint nuevo debe soportar GET y HEAD (UptimeRobot usa HEAD)
+4. No agregar dependencias pesadas (statsmodels, scikit-learn, torch)
+   - Render FREE tiene 512MB RAM y timeout de build de 30min
+5. Commits pequeños y descriptivos en español
+
+## MOTOR DE DECISIÓN (Brujula v4.1)
+9 estados jerárquicos por activo:
+  #1 CAOS (Hard Gate)          → p_caos >= 0.75
+  #2 SIN DATOS                 → contexto vacío
+  #3 1H RANGO                  → sin tendencia macro
+  #4 1H == 15m == 5m           → BULL/BEAR FUERTE o DÉBIL
+  #5 15m+5m contra 1H          → GIRO (fza>=2) / COUNTER (fza<=1)
+  #6 15m contra 1H, 5m no      → PULLBACK
+  #7 Fallback                  → NO OPERAR
+
+## PRESETS POR RÉGIMEN (del bot original en Colab)
+- caos:      mercado caótico, parámetros estrictos
+- rango:     mercado lateral, parámetros base (C7_Hibrido_Wide)
+- tendencia: mercado tendencial, parámetros permisivos
+
+## HERRAMIENTAS DE INVESTIGACIÓN (solo local VS Code)
+Para backtesting y análisis usa ESTO (no herramientas overkill):
+- VectorBT free: backtesting masivo de parámetros
+- QuantStats: reportes Sharpe/Sortino/Drawdown
+- pytest: tests unitarios de cada módulo
+- Git + ramas: control de versiones
+
+NO USES (no funcionan en cuentas FREE):
+- Mem0 (requiere $$$ de OpenAI)
+- Crawl4AI (OOM en 512MB RAM)
+- FinRL / Qlib (requieren GPU)
+- Hummingbot (otro proyecto entero)
+
+## TAREAS PENDIENTES (al retomar)
+1. Conectar Turso (DB SQLite en la nube, cuenta FREE 9GB)
+   - Crear tabla `signals` con: coin, direction, score, timestamp, precio
+   - Variables en .env: TURSO_URL, TURSO_TOKEN
+   - Librería: `libsql-client` (agregar a requirements.txt)
+
+2. Envío a Telegram
+   - Solo cuando cambia el estado (LONG/SHORT/NEUTRAL)
+   - Variables en .env: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+   - Librería: `python-telegram-bot` o aiohttp directo
+
+3. Crear módulo `signal_aggregator.py`
+   - Consolida bias 1H + 15m + 5m + p_caos + RVD + Z-Score
+   - Si >= 4/6 alineados BULL → LONG
+   - Si >= 4/6 alineados BEAR → SHORT
+   - Endpoint nuevo: GET /api/signals
+
+## FIX URGENTE (statsmodels)
+Si algún día se reintroduce statsmodels, usar:
+  adfuller(x, result_object=False)
+para evitar FutureWarning de 2027.
+
+## FLUJO DE TRABAJO
+1. Editar código en VS Code (rama feature/xxx)
+2. Probar localmente (python -m app.main)
+3. Commit + push a GitHub
+4. Render detecta y redeploya automáticamente (~2 min)
+5. Verificar UptimeRobot (monitor verde)
+6. Validar en https://bot-tendencia-brujula.onrender.com
+
+## CONVENCIONES
+- Commits en español, imperativo: "agrega endpoint /api/signals"
+- Variables de entorno en config.py vía os.getenv()
+- Logging con print() simple (no logger pesado)
+- Tipado defensivo: .get() con defaults, try/except amplio
+- Nombres en español cuando aplique (brujula, cartografo)
