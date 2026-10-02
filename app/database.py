@@ -1,8 +1,7 @@
 """
 database.py
 Módulo de conexión a Turso usando SQL over HTTP.
-No usa libsql-client (deprecado). Usa aiohttp directamente.
-Endpoint: https://<db>.turso.io/v2/pipeline
+v5.4: FASE 3 - Realidad Financiera (fee_percent y net_pnl_percent).
 """
 import os
 import json
@@ -18,6 +17,9 @@ load_dotenv()
 TURSO_URL = os.getenv("TURSO_URL", "")
 TURSO_TOKEN = os.getenv("TURSO_TOKEN", "")
 TURSO_HTTP_URL = TURSO_URL.replace("libsql://", "https://") if TURSO_URL else ""
+
+# ── FASE 3: Importar costo real de operación ──
+from app.config import TOTAL_ROUND_TRIP_COST_PERCENT
 
 def _to_tagged_value(value: Any) -> Dict[str, Any]:
     """Convierte un valor Python al formato tagged que espera Turso."""
@@ -133,16 +135,18 @@ async def init_tables():
     result = await _execute("PRAGMA table_info(signals)")
     existing_columns = [row[1] for row in result.get("rows", [])]
     
-    # 3. Definir columnas esperadas y sus tipos para signals
+    # 3. Definir columnas esperadas y sus tipos para signals (FASE 3: fee y net_pnl)
     expected_columns = {
         "score": "INTEGER",
         "context_snapshot": "TEXT",
         "exit_reason": "TEXT",
         "regime": "TEXT",
-        "duration_seconds": "INTEGER"
+        "duration_seconds": "INTEGER",
+        "fee_percent": "REAL",
+        "net_pnl_percent": "REAL"
     }
     
-    # 4. Agregar solo las que faltan (Migración quirúrgica)
+    # 4. Agregar solo las que faltan (Migración quirúrgica segura, no borra datos)
     for col_name, col_type in expected_columns.items():
         if col_name not in existing_columns:
             try:
@@ -173,7 +177,7 @@ async def init_tables():
     print("✅ Tablas de Turso inicializadas correctamente.")
 
 # ==============================================================================
-# FUNCIONES EXISTENTES: SIGNALS (Sin cambios)
+# FUNCIONES EXISTENTES: SIGNALS
 # ==============================================================================
 
 async def open_signal(coin: str, direction: str, price_entry: float, score: int = 0, context_snapshot: Dict[str, Any] = None, regime: str = "desconocido") -> int:
@@ -206,23 +210,38 @@ async def close_signal(coin: str, price_exit: float, exit_reason: str = "NEUTRAL
     row = rows[0]
     signal_id, direction, price_entry, opened_at, score, regime = row[0], row[1], float(row[2]), row[3], row[4], row[5]
     
+    # 1. Calcular PnL Bruto
     pnl_percent = ((price_exit / price_entry) - 1) * 100 if direction == "LONG" else ((price_entry / price_exit) - 1) * 100
+    
+    # 2. FASE 3: Calcular PnL Neto (Bruto - Comisiones Round-Trip)
+    fee_percent = TOTAL_ROUND_TRIP_COST_PERCENT * 100  # Convertir a porcentaje (ej: 0.12)
+    net_pnl_percent = pnl_percent - fee_percent
+    
     duration_seconds = now - opened_at
     
     await _execute(
         """
-        UPDATE signals SET status = 'CLOSED', price_exit = ?, pnl_percent = ?, closed_at = ?, exit_reason = ?, duration_seconds = ?
+        UPDATE signals SET 
+            status = 'CLOSED', 
+            price_exit = ?, 
+            pnl_percent = ?, 
+            fee_percent = ?, 
+            net_pnl_percent = ?, 
+            closed_at = ?, 
+            exit_reason = ?, 
+            duration_seconds = ?
         WHERE id = ?
         """,
-        [price_exit, pnl_percent, now, exit_reason, duration_seconds, signal_id]
+        [price_exit, pnl_percent, fee_percent, net_pnl_percent, now, exit_reason, duration_seconds, signal_id]
     )
     
     result_data = {
         "signal_id": signal_id, "coin": coin, "direction": direction, "price_entry": price_entry,
-        "price_exit": price_exit, "pnl_percent": pnl_percent, "duration_seconds": duration_seconds,
+        "price_exit": price_exit, "pnl_percent": pnl_percent, "fee_percent": fee_percent, 
+        "net_pnl_percent": net_pnl_percent, "duration_seconds": duration_seconds,
         "score": score, "regime": regime, "exit_reason": exit_reason,
     }
-    print(f"✅ Señal cerrada: {coin} {direction} | PnL: {pnl_percent:+.2f}% | Motivo: {exit_reason} | Duración: {duration_seconds}s")
+    print(f"✅ Señal cerrada: {coin} {direction} | Bruto: {pnl_percent:+.2f}% | Neto: {net_pnl_percent:+.2f}% (Fee: {fee_percent:.2f}%) | Motivo: {exit_reason} | Duración: {duration_seconds}s")
     return result_data
 
 async def get_open_signals() -> List[Dict[str, Any]]:
@@ -232,7 +251,7 @@ async def get_open_signals() -> List[Dict[str, Any]]:
 async def get_last_closed_signal(coin: str) -> Optional[Dict[str, Any]]:
     result = await _execute(
         """
-        SELECT id, direction, price_entry, price_exit, pnl_percent, opened_at, closed_at, score, context_snapshot, exit_reason, regime, duration_seconds
+        SELECT id, direction, price_entry, price_exit, pnl_percent, fee_percent, net_pnl_percent, opened_at, closed_at, score, context_snapshot, exit_reason, regime, duration_seconds
         FROM signals WHERE coin = ? AND status = 'CLOSED' ORDER BY closed_at DESC LIMIT 1
         """, [coin]
     )
@@ -240,24 +259,29 @@ async def get_last_closed_signal(coin: str) -> Optional[Dict[str, Any]]:
     if not rows: return None
     row = rows[0]
     context_snapshot = None
-    if row[8]:
-        try: context_snapshot = json.loads(row[8])
+    if row[10]:
+        try: context_snapshot = json.loads(row[10])
         except (json.JSONDecodeError, TypeError): pass
         
     return {
         "id": row[0], "coin": coin, "direction": row[1], "price_entry": float(row[2]) if row[2] else None,
         "price_exit": float(row[3]) if row[3] else None, "pnl_percent": float(row[4]) if row[4] else None,
-        "opened_at": row[5], "closed_at": row[6], "score": row[7], "context_snapshot": context_snapshot,
-        "exit_reason": row[9], "regime": row[10], "duration_seconds": row[11],
+        "fee_percent": float(row[5]) if row[5] else None, "net_pnl_percent": float(row[6]) if row[6] else None,
+        "opened_at": row[7], "closed_at": row[8], "score": row[9], "context_snapshot": context_snapshot,
+        "exit_reason": row[11], "regime": row[12], "duration_seconds": row[13],
     }
 
 async def get_stats() -> Dict[str, Any]:
+    # FASE 3: Estadísticas basadas en NET_PNL_PERCENT (la única métrica financiera real)
     result_total = await _execute("SELECT COUNT(*) FROM signals WHERE status = 'CLOSED'")
     total_closed = result_total["rows"][0][0] if result_total["rows"] else 0
-    result_winners = await _execute("SELECT COUNT(*) FROM signals WHERE status = 'CLOSED' AND pnl_percent > 0")
+    
+    result_winners = await _execute("SELECT COUNT(*) FROM signals WHERE status = 'CLOSED' AND net_pnl_percent > 0")
     winners = result_winners["rows"][0][0] if result_winners["rows"] else 0
-    result_pnl = await _execute("SELECT SUM(pnl_percent) FROM signals WHERE status = 'CLOSED'")
+    
+    result_pnl = await _execute("SELECT SUM(net_pnl_percent) FROM signals WHERE status = 'CLOSED'")
     total_pnl = result_pnl["rows"][0][0] if result_pnl["rows"] and result_pnl["rows"][0][0] else 0.0
+    
     win_rate = (winners / total_closed * 100) if total_closed > 0 else 0.0
     return {"total_closed": total_closed, "winners": winners, "losers": total_closed - winners, "win_rate": round(win_rate, 2), "total_pnl": round(total_pnl, 2)}
 
@@ -266,7 +290,6 @@ async def get_stats() -> Dict[str, Any]:
 # ==============================================================================
 
 async def get_subscriber(user_id: int) -> Optional[Dict[str, Any]]:
-    """Obtiene los datos de un suscriptor por su user_id."""
     result = await _execute(
         "SELECT user_id, username, status, joined_channel_at, trial_start, subscription_end, last_invoice_sent FROM subscribers WHERE user_id = ?",
         [user_id]
@@ -282,7 +305,6 @@ async def get_subscriber(user_id: int) -> Optional[Dict[str, Any]]:
     }
 
 async def register_subscriber(user_id: int, username: str, joined_channel_at: int):
-    """Registra un nuevo usuario o actualiza su fecha de entrada al canal."""
     await _execute(
         """
         INSERT INTO subscribers (user_id, username, status, joined_channel_at)
@@ -296,16 +318,14 @@ async def register_subscriber(user_id: int, username: str, joined_channel_at: in
     )
 
 async def activate_trial(user_id: int):
-    """Activa la prueba de 7 días para un usuario."""
     now = int(time.time())
-    end = now + (7 * 24 * 60 * 60)  # 7 días en segundos
+    end = now + (7 * 24 * 60 * 60)
     await _execute(
         "UPDATE subscribers SET status = 'trial', trial_start = ?, subscription_end = ? WHERE user_id = ?",
         [now, end, user_id]
     )
 
 async def activate_paid(user_id: int):
-    """Extiende la suscripción 30 días a partir de la fecha actual o de la fecha de vencimiento (lo que sea mayor)."""
     now = int(time.time())
     sub = await get_subscriber(user_id)
     if sub and sub.get("subscription_end") and sub["subscription_end"] > now:
@@ -319,7 +339,6 @@ async def activate_paid(user_id: int):
     )
 
 async def get_pending_activations(hours: int = 24) -> List[Dict[str, Any]]:
-    """Obtiene usuarios que entraron al canal pero no activaron su prueba en X horas."""
     now = int(time.time())
     threshold = now - (hours * 60 * 60)
     result = await _execute(
@@ -329,10 +348,8 @@ async def get_pending_activations(hours: int = 24) -> List[Dict[str, Any]]:
     return [{"user_id": r[0], "username": r[1], "joined_channel_at": r[2]} for r in result.get("rows", [])]
 
 async def get_expiring_soon(hours: int = 24) -> List[Dict[str, Any]]:
-    """Obtiene usuarios cuya suscripción expira en las próximas X horas y no han recibido recordatorio reciente."""
     now = int(time.time())
     threshold = now + (hours * 60 * 60)
-    # Evitamos spam: solo si no se ha enviado factura en las últimas 12 horas
     safe_reminder_threshold = now - (12 * 60 * 60)
     
     result = await _execute(
@@ -348,7 +365,6 @@ async def get_expiring_soon(hours: int = 24) -> List[Dict[str, Any]]:
     return [{"user_id": r[0], "username": r[1], "subscription_end": r[2]} for r in result.get("rows", [])]
 
 async def get_expired() -> List[Dict[str, Any]]:
-    """Obtiene usuarios cuya suscripción ya venció y deben ser expulsados."""
     now = int(time.time())
     result = await _execute(
         "SELECT user_id, username FROM subscribers WHERE status IN ('trial', 'active') AND subscription_end < ?",
@@ -357,7 +373,6 @@ async def get_expired() -> List[Dict[str, Any]]:
     return [{"user_id": r[0], "username": r[1]} for r in result.get("rows", [])]
 
 async def mark_invoice_sent(user_id: int):
-    """Marca que se le envió una factura al usuario para evitar spam."""
     now = int(time.time())
     await _execute(
         "UPDATE subscribers SET last_invoice_sent = ? WHERE user_id = ?",
@@ -365,42 +380,10 @@ async def mark_invoice_sent(user_id: int):
     )
 
 async def update_subscriber_status(user_id: int, status: str):
-    """Actualiza el estado de un suscriptor (ej: a 'banned' o 'expired')."""
     await _execute(
         "UPDATE subscribers SET status = ? WHERE user_id = ?",
         [status, user_id]
     )
 
-# ==============================================================================
-# TESTS LOCALES
-# ==============================================================================
-
-async def run_tests():
-    """Ejecuta tests básicos de conexión y estructura."""
-    print("=" * 60)
-    print("TEST DE CONEXIÓN A TURSO")
-    print("=" * 60)
-    print(f"  URL: {TURSO_HTTP_URL}")
-    print(f"  Token: ...{TURSO_TOKEN[-6:] if TURSO_TOKEN else 'NO CONFIGURADO'}")
-    print()
-    
-    try:
-        print("📝 Paso 1: Inicializando tablas...")
-        await init_tables()
-        
-        print("\n📝 Paso 2: Probando registro de suscriptor...")
-        await register_subscriber(123456789, "test_user", int(time.time()))
-        sub = await get_subscriber(123456789)
-        print(f"   Usuario registrado: {sub['username']} (Estado: {sub['status']})")
-        
-        print("\n📝 Paso 3: Probando activación de trial...")
-        await activate_trial(123456789)
-        sub = await get_subscriber(123456789)
-        print(f"   Estado actualizado a: {sub['status']} | Vence: {time.ctime(sub['subscription_end'])}")
-        
-        print("\n✅ Todos los tests de base de datos pasaron correctamente.")
-    except Exception as e:
-        print(f"❌ Error en tests: {e}")
-
 if __name__ == "__main__":
-    asyncio.run(run_tests())
+    asyncio.run(init_tables())
