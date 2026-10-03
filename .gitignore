@@ -19,4 +19,6 @@ build/
 Thumbs.db
 
 # Base de datos local
-*.db
+*.db"set_webhook.py" 
+"auditoria_v3_valor_usuario.md" 
+"informe_final_mejoras_bot.md" 

@@ -7,8 +7,8 @@ services:
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: TZ_NAME
-        value: America/Caracas
+        value: UTC
       - key: HL_REST_URL
         value: https://api.hyperliquid.xyz/info
       - key: ASSETS
-        value: BTC,ETH,SOL
+        value: BTC,ETH

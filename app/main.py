@@ -1,41 +1,34 @@
 """
-FastAPI app para Bot Tendencia - Brujula MTF.
-Sirve el dashboard como pagina web bajo demanda.
-v5.1: + Webhook para Telegram + Revisión de suscripciones en /tick.
-- Las señales se evalúan automáticamente aunque nadie visite la web.
-- GitHub Actions llama a /tick cada 15 min para mantener Render despierto y revisar VIPs.
-- /webhook recibe /start, pagos y entradas al canal.
+FastAPI app v5.5 FINAL: Seguridad aplicada + version bump + close_session.
+v4.0 FIXES aplicados:
+  - Auth en /api/weekly-stats (dev riesgo #1)
+  - Validación secret_token en webhook (dev riesgo #2)
+  - init_tables en startup (dev bug #6)
 """
+import os
 import time
 import asyncio
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Header
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from app.cartografo import ejecutar_cartografo, fetch_precios_rapidos
 from app.brujula import render_brujula
 from app.signal_aggregator import evaluar_y_ejecutar_senales
-from app.config import ASSETS, TZ_NAME, HL_REST_URL, CACHE_TTL, CACHE_TTL_PRECIOS, VIP_CHANNEL_ID
-
-# --- NUEVOS IMPORTS PARA SISTEMA VIP ---
+from app.config import (
+    ASSETS, TZ_NAME, HL_REST_URL, CACHE_TTL, CACHE_TTL_PRECIOS, VIP_CHANNEL_ID,
+    WEBHOOK_SECRET, API_KEY,  # === v4.0 ===
+)
 from app.subscriptions import run_subscription_checks, handle_start_command, handle_successful_payment
-from app.database import register_subscriber
-# ---------------------------------------
+from app.database import register_subscriber, get_weekly_stats, init_tables  # === v4.0 FIX === - init_tables
 
-# ── Intervalo del scheduler interno (segundos) ──
 SCHEDULER_INTERVAL = 60
 
-# ======================================================================
-# SCHEDULER INTERNO: ejecuta Signal Aggregator cada 60s en background
-# ======================================================================
+
 async def signal_scheduler():
-    """
-    Bucle infinito que ejecuta Signal Aggregator cada SCHEDULER_INTERVAL segundos.
-    Corre en background mientras el servicio esté activo.
-    """
+    """Bucle infinito que ejecuta Signal Aggregator cada SCHEDULER_INTERVAL segundos."""
     await asyncio.sleep(5)
     print(f"✅ Scheduler de señales iniciado (cada {SCHEDULER_INTERVAL}s)")
-    
     while True:
         try:
             print(f"\n⏰ [{time.strftime('%H:%M:%S')}] Scheduler ejecutando Signal Aggregator...")
@@ -48,15 +41,20 @@ async def signal_scheduler():
             break
         except Exception as e:
             print(f"❌ [{time.strftime('%H:%M:%S')}] Error en scheduler: {type(e).__name__}: {e}")
-        
         await asyncio.sleep(SCHEDULER_INTERVAL)
 
-# ======================================================================
-# LIFESPAN: inicia el scheduler al arrancar la aplicación
-# ======================================================================
+
+# === v4.0 FIX === - Bug #6: init_tables en startup
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Inicia el scheduler al arrancar y lo detiene al cerrar."""
+    """Inicia el scheduler + init_tables al arrancar, limpia al cerrar."""
+    # === v4.0 FIX === - Asegurar que las tablas existen antes de cualquier query
+    try:
+        await init_tables()
+        print("✅ Tablas inicializadas en startup")
+    except Exception as e:
+        print(f"⚠️ Error en init_tables startup: {e}")
+
     task = asyncio.create_task(signal_scheduler())
     yield
     task.cancel()
@@ -64,151 +62,154 @@ async def lifespan(app: FastAPI):
         await task
     except asyncio.CancelledError:
         pass
+    from app.database import close_session
+    await close_session()
+
 
 app = FastAPI(
     title="Bot Tendencia - Brujula MTF",
     description="Dashboard on-demand + scheduler para señales 24/7 + VIP",
-    version="5.1.0",
+    version="5.5.0",  # === v4.0 === - bump
     lifespan=lifespan,
 )
 
-# ── Cache compartido ──
 _cache = {"gem_context": None, "timestamp": 0.0}
 _cache_html = {"html": None, "gem_timestamp": 0.0}
 _cache_precios = {"data": None, "timestamp": 0.0}
 _cache_senales = {"data": None, "timestamp": 0.0}
 
-# ======================================================================
-# ENDPOINTS
-# ======================================================================
 
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
-    """Endpoint para GitHub Actions / UptimeRobot - respuesta rapida."""
     return {"status": "ok", "service": "bot-tendencia-brujula"}
+
 
 @app.get("/tick")
 async def tick():
-    """
-    Endpoint para GitHub Actions (llamado cada 15 min).
-    Ejecuta Signal Aggregator y revisa suscripciones VIP.
-    """
     try:
         t0 = time.time()
-        
-        # 1. Evaluar señales de trading
         senales = await evaluar_y_ejecutar_senales()
-        
-        # 2. NUEVO: Revisar suscripciones VIP (vencimientos, recordatorios, expulsiones)
         await run_subscription_checks()
-
         elapsed = time.time() - t0
         print(f"✅ [/tick] Completado en {elapsed:.1f}s — {len(senales)} activos evaluados")
-        
         return {
-            "status": "ok",
-            "elapsed_seconds": round(elapsed, 2),
-            "assets_evaluated": len(senales),
-            "timestamp": int(time.time()),
+            "status": "ok", "elapsed_seconds": round(elapsed, 2),
+            "assets_evaluated": len(senales), "timestamp": int(time.time()),
         }
     except Exception as e:
         print(f"❌ [/tick] Error: {type(e).__name__}: {e}")
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
-# --- NUEVO ENDPOINT: WEBHOOK DE TELEGRAM ---
+
+# === v4.0 FIX === - Dev riesgo #2: validación secret_token en webhook
 @app.post("/webhook")
-async def telegram_webhook(request: Request):
+async def telegram_webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: str = Header(None),
+):
     """
-    Recibe actualizaciones de Telegram (mensajes, pagos, entradas al canal).
+    Recibe actualizaciones de Telegram.
+    v4.0: valida secret_token configurado en setWebhook.
+    Para configurar:
+      curl -X POST "https://api.telegram.org/bot<TOKEN>/setWebhook" \
+        -d '{"url": "<URL>/webhook", "secret_token": "<WEBHOOK_SECRET>"}'
     """
+    # === v4.0 FIX === - Validación de seguridad
+    if WEBHOOK_SECRET:
+        if not x_telegram_bot_api_secret_token or x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
+            print(f"⚠️ Webhook rechazado: secret_token inválido o ausente")
+            return JSONResponse(status_code=403, content={"error": "Forbidden"})
+
     try:
         update = await request.json()
-        
-        # 1. Mensajes de texto (ej. /start)
+
         if "message" in update:
             msg = update["message"]
             chat_id = msg["chat"]["id"]
             username = msg["from"].get("username", "")
             text = msg.get("text", "")
-            
+
             if text and text.startswith("/start"):
                 print(f"🚀 Comando /start recibido de {username} ({chat_id})")
                 await handle_start_command(chat_id, username)
-                
+
             if "successful_payment" in msg:
                 user_id = msg["from"]["id"]
                 print(f"💰 Pago exitoso detectado para user_id: {user_id}")
                 await handle_successful_payment(user_id)
-                
-        # 2. Cambios de estado en el canal (entradas/salidas)
+
         elif "chat_member" in update:
             cm = update["chat_member"]
             chat_id = cm["chat"]["id"]
             user_id = cm["new_chat_member"]["user"]["id"]
             username = cm["new_chat_member"]["user"].get("username", "")
             new_status = cm["new_chat_member"]["status"]
-            
+
             if chat_id == VIP_CHANNEL_ID and new_status in ("member", "administrator"):
                 now = int(time.time())
                 await register_subscriber(user_id, username, now)
                 print(f"👤 Nuevo usuario detectado en canal VIP: {username} ({user_id})")
 
-        return {"ok": True} # Siempre devolver OK a Telegram
+        return {"ok": True}
     except Exception as e:
         print(f"❌ [/webhook] Error procesando update: {e}")
         return {"ok": True}
-# -------------------------------------------
+
 
 @app.api_route("/api/prices", methods=["GET", "HEAD"])
 async def api_prices():
-    """Endpoint ligero: solo precios actuales (cache 30s)."""
     now = time.time()
     if _cache_precios["data"] is None or (now - _cache_precios["timestamp"]) > CACHE_TTL_PRECIOS:
         _cache_precios["data"] = await fetch_precios_rapidos()
         _cache_precios["timestamp"] = now
-        
     return JSONResponse(content={
-        "assets": ASSETS,
-        "timestamp": int(_cache_precios["timestamp"]),
-        "cache_ttl": CACHE_TTL_PRECIOS,
-        "prices": _cache_precios["data"],
+        "assets": ASSETS, "timestamp": int(_cache_precios["timestamp"]),
+        "cache_ttl": CACHE_TTL_PRECIOS, "prices": _cache_precios["data"],
     })
+
 
 @app.get("/api/data")
 async def api_data():
-    """Retorna los datos crudos del Cartografo en JSON."""
     now = time.time()
     if _cache["gem_context"] is None or (now - _cache["timestamp"]) > CACHE_TTL:
         _cache["gem_context"] = await ejecutar_cartografo()
         _cache["timestamp"] = now
         _cache_html["html"] = None
         _cache_senales["data"] = None
-        
     return JSONResponse(content={
-        "assets": ASSETS,
-        "timestamp": int(_cache["timestamp"]),
-        "cache_ttl": CACHE_TTL,
-        "data": _cache["gem_context"],
+        "assets": ASSETS, "timestamp": int(_cache["timestamp"]),
+        "cache_ttl": CACHE_TTL, "data": _cache["gem_context"],
     })
+
+
+# === v4.0 FIX === - Dev riesgo #1: auth en /api/weekly-stats
+@app.get("/api/weekly-stats")
+async def weekly_stats(x_api_key: str = Header(None)):
+    """
+    Métricas semanales (últimos 7 días). Requiere API_KEY.
+    v4.0: autenticación con header X-API-Key.
+    """
+    if API_KEY:
+        if not x_api_key or x_api_key != API_KEY:
+            return JSONResponse(status_code=401, content={"error": "Unauthorized"})
+    return JSONResponse(content=await get_weekly_stats())
+
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    """Pagina principal - renderiza la Brujula."""
     now = time.time()
-    
     if _cache["gem_context"] is None or (now - _cache["timestamp"]) > CACHE_TTL:
         t0 = time.time()
         _cache["gem_context"] = await ejecutar_cartografo()
         _cache["timestamp"] = now
         _cache_html["html"] = None
-        
         try:
             _cache_senales["data"] = await evaluar_y_ejecutar_senales()
             _cache_senales["timestamp"] = now
         except Exception as e:
             print(f"❌ Error en Signal Aggregator (index): {e}")
             _cache_senales["data"] = None
-            
+
     if _cache_html["html"] is None:
         t0 = time.time()
         base_html = render_brujula(_cache["gem_context"], _cache_senales["data"])
@@ -219,7 +220,7 @@ async def index():
         )
         _cache_html["html"] = base_html + footer
         _cache_html["gem_timestamp"] = _cache["timestamp"]
-        
+
     js_code = f"""
     <script>
     (function() {{
@@ -265,7 +266,7 @@ async def index():
     }})();
     </script>
     """
-    
+
     page = (
         '<!DOCTYPE html><html lang="es"><head>'
         '<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">'
@@ -276,21 +277,20 @@ async def index():
         f'{js_code}'
         '</body></html>'
     )
-    
     return HTMLResponse(content=page)
+
 
 if __name__ == "__main__":
     import uvicorn
     print("=" * 60)
-    print("BOT TENDENCIA - BRUJULA MTF v5.1 (+ VIP)")
+    print("BOT TENDENCIA v5.5 FINAL (v4.0 features)")
     print("=" * 60)
     print(f"  Activos: {ASSETS}")
     print(f"  API: {HL_REST_URL}")
     print(f"  TZ: {TZ_NAME}")
     print(f"  Abriendo en http://127.0.0.1:8000")
-    print(f"  Precios en vivo: cada {CACHE_TTL_PRECIOS}s")
-    print(f"  Scheduler interno: cada {SCHEDULER_INTERVAL}s")
-    print(f"  Endpoint /tick: para GitHub Actions cada 15 min")
-    print(f"  Endpoint /webhook: para Telegram")
+    print(f"  Scheduler cada {SCHEDULER_INTERVAL}s")
+    print(f"  WEBHOOK_SECRET: {'✅ set' if WEBHOOK_SECRET else '❌ NOT SET'}")
+    print(f"  API_KEY: {'✅ set' if API_KEY else '❌ NOT SET'}")
     print("=" * 60)
     uvicorn.run(app, host="127.0.0.1", port=8000)
