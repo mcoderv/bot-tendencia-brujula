@@ -13,13 +13,13 @@ from app.telegram import enviar_alerta_apertura, enviar_alerta_cierre, enviar_al
 from app.config import (
     MIN_SCORE_TO_TRADE, ALLOWED_REGIMES, TOTAL_ROUND_TRIP_COST_PERCENT,
     FUNDING_EXTREME, INVALIDATION_WARN_DIST, MIN_RR_RATIO, INVALIDATION_COOLDOWN,
+    MIN_DURATION_NEUTRAL, MIN_DURATION_FLIP,  # === v5.5 FIX === - desde env vars
 )
 
 MIN_FUERZA_SENAL = 2
 MAX_DIST_SENAL = 1.5
 CAOS_HARD_GATE = 0.75
-MIN_DURATION_NEUTRAL = 180
-MIN_DURATION_FLIP = 60
+# === v5.5 FIX === MIN_DURATION_NEUTRAL/FLIP ahora desde app.config (env vars)
 
 def _decidir_direccion(estado_key, b15, fza, dist, p_caos):
     """Retorna (direction, score) con escala 0-6."""
