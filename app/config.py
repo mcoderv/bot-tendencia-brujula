@@ -41,6 +41,12 @@ MIN_RR_RATIO: float = float(os.getenv("MIN_RR_RATIO", "1.5"))
 # === v4.0 FINAL === - Cooldown de alerta de invalidación
 INVALIDATION_COOLDOWN: int = int(os.getenv("INVALIDATION_COOLDOWN", "900"))  # 15 min
 
+# === v5.5 FIX === - Duración mínima antes de permitir cierre por cambio de bias
+# Default 180s (3 min) generaba 81% de trades break-even.
+# Subido a 900s (15 min) para dejar que la tesis se desarrolle.
+MIN_DURATION_NEUTRAL: int = int(os.getenv("MIN_DURATION_NEUTRAL", "900"))  # 15 min
+MIN_DURATION_FLIP: int = int(os.getenv("MIN_DURATION_FLIP", "300"))      # 5 min
+
 # ── Realidad Financiera ──
 TAKER_FEE_PERCENT: float = float(os.getenv("TAKER_FEE_PERCENT", "0.00035"))
 MAKER_FEE_PERCENT: float = float(os.getenv("MAKER_FEE_PERCENT", "0.00020"))
