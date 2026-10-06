@@ -1,6 +1,6 @@
 """
 levels.py — Cálculo de zonas operativas sugeridas para las alertas.
-v4.0 FINAL: Edge case ATR=0 manejado (dev bug #8).
+v4.0 FINAL: Edge case ATR=0 manejado + fix bug SHORT tp2.
 """
 from typing import Dict, Any, Optional
 
@@ -12,7 +12,6 @@ INVALIDATION_BUFFER_ATR = 0.3
 
 # === v4.0 FIX === - Edge case: ATR muy bajo o cero
 MIN_ATR_THRESHOLD = 1.0  # Mínimo ATR(15m) en USD para considerar señal válida
-
 
 def calcular_zonas_operativas(
     price: float,
@@ -26,14 +25,16 @@ def calcular_zonas_operativas(
     Calcula zonas operativas (entry, invalidation, TP1, TP2, R:R).
     Retorna None si los datos son insuficientes o el ATR es muy bajo.
     v4.0 FIX: maneja ATR=0 (dev bug #8 — ZeroDivisionError).
+    v4.0 FIX: corrige bug en cálculo de tp2 para SHORT (max → min).
     """
     # === v4.0 FIX === - Validación robusta
     if price <= 0 or atr_15m <= 0:
         return None
+    
     # === v4.0 FIX === - Edge case ATR muy bajo (mercado plano, fin de semana)
     if atr_15m < MIN_ATR_THRESHOLD:
         return None
-
+    
     if direction == "LONG":
         entry_low = price - (ENTRY_PULLBACK_ATR * atr_15m)
         entry_high = price
@@ -51,8 +52,9 @@ def calcular_zonas_operativas(
         invalidation = resistance + (INVALIDATION_BUFFER_ATR * atr_15m)
         tp1 = entry_low - (TP1_ATR_MULT * atr_15m)
         tp2_candidate = price - (TP2_ATR_MULT * atr_15m)
-        tp2 = max(l24, tp2_candidate) if 0 < l24 > tp2_candidate else tp2_candidate
-
+        # === v4.0 FIX === - Bug corregido: max → min, condición corregida
+        tp2 = min(l24, tp2_candidate) if 0 < l24 < tp2_candidate else tp2_candidate
+    
     # R:R calculation
     if direction == "LONG":
         risk = abs(entry_high - invalidation)
@@ -62,12 +64,13 @@ def calcular_zonas_operativas(
         risk = abs(invalidation - entry_low)
         reward_tp1 = abs(entry_low - tp1)
         reward_tp2 = abs(entry_low - tp2)
-
+    
     # === v4.0 FIX === - Evitar ZeroDivisionError si risk=0
     if risk <= 0:
         return None
+    
     rr_ratio = reward_tp1 / risk
-
+    
     return {
         "entry_low": round(entry_low, 2),
         "entry_high": round(entry_high, 2),
